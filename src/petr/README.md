@@ -7,7 +7,6 @@
 
 2. 编译
 
-    Z:\qiyuan_project\ros2_detector_ws\src\petr\src\cpp\main.cpp:39 摄像头命名提前询问
     ```
     cd <path to workspace>/petr
     colcon build

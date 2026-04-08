@@ -56,8 +56,11 @@ find_package(CUDA REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(CURL REQUIRED)
 find_package(cv_bridge REQUIRED)
+find_package(yaml-cpp REQUIRED)
 
-if(BUILD_TESTING)
+option(PETR_ENABLE_LINT "Enable ament lint checks during BUILD_TESTING" OFF)
+
+if(BUILD_TESTING AND PETR_ENABLE_LINT)
   find_package(ament_lint_auto REQUIRED)
   # the following line skips the linter which checks for copyrights
   # uncomment the line when a copyright and license is not present in all source files
@@ -115,6 +118,7 @@ target_link_libraries(${PROJECT_NAME}
     ${OpenCV_LIBRARIES}
     ${CUDA_LIBRARIES}
     CURL::libcurl
+    yaml-cpp
 )
 
 install(TARGETS
@@ -125,6 +129,7 @@ install(TARGETS
 install(DIRECTORY
   models
   calibration
+  config
   DESTINATION share/${PROJECT_NAME}
 )
 
