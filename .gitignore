@@ -1,0 +1,58 @@
+# --- Build and Install Artifacts ---
+install/
+build/
+log/
+
+# --- Python Caches and Packaging ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+
+# --- C++ Objects and Binary Files ---
+*.so
+*.a
+*.o
+*.obj
+*.dll
+*.exe
+*.out
+
+# --- Neural Network Files ---
+*.engine
+*.onnx
+
+# --- IDEs and Text Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# --- Debugging and System Logs ---
+*.log
+*.pcap
+*.strace
+
+# --- Environment and Virtual Envs ---
+venv/
+.venv/
+env/
+.env
+
+# --- ROS Specific Tools/Temp Files ---
+.catkin_tools/
+
+
+# --- Coding Agent Artifacts ---
+.codex
+
+# --- Miscellaneous ---
+@eaDir/
+Thumbs.db

@@ -1,0 +1,19 @@
+Language: Cpp # 语言（Cpp/Java/JavaScript 等）
+BasedOnStyle: LLVM
+SpacesInParentheses: false
+
+# 缩进与空格
+AccessModifierOffset: -4 # 访问修饰符（public/private）缩进
+IndentWidth: 4 # 缩进宽度（空格数）
+TabWidth: 4 # Tab 宽度
+UseTab: Never # 禁止使用 Tab（Always/Never）
+
+# 换行与括号
+BreakBeforeBraces: Allman # 大括号换行风格（Allman, Stroustrup, GNU...）
+AllowShortIfStatementsOnASingleLine: false # 禁止单行 if
+BinPackArguments: false # 禁止将函数参数挤在一行
+ColumnLimit: 100 # 行宽限制
+# 空格与对齐
+SpaceBeforeParens: ControlStatements # 控制语句括号前加空格
+AlignAfterOpenBracket: Align # 对齐括号内内容
+AlignConsecutiveMacros: true # 对齐连续宏定义
