@@ -169,7 +169,7 @@ void Model::inference(cv::Mat image) {
 
 bool Model::enqueue_bindings() {
     m_timer->start_gpu();
-    if (!m_context->enqueueV2((void**)m_bindings, m_stream, nullptr)){
+    if (!m_context->enqueueV2(m_bindings.data(), m_stream, nullptr)){
         LOG("Error happens during DNN inference part, program terminated");
         return false;
     }

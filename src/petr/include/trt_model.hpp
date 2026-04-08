@@ -129,7 +129,7 @@ public:
     Params* m_params;
 
     std::size_t m_workspaceSize;
-    void* m_bindings[4];  // input + up to 3 outputs
+    std::vector<void*> m_bindings;
     float* m_inputMemory[2];
     float* m_outputMemory[2];
 

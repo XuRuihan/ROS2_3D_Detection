@@ -4,7 +4,9 @@
 #include "utils.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <array>
+#include <filesystem>
 #include <iomanip>
 #include <memory>
 #include <sstream>
@@ -34,7 +36,8 @@ class MultiCamDetectorNode : public rclcpp::Node
 public:
     static constexpr std::size_t kCameraCount = 6;
 
-    explicit MultiCamDetectorNode(const std::string &node_name) : rclcpp::Node(node_name)
+    explicit MultiCamDetectorNode(const std::string &node_name, const std::string &cli_sensor_info_path = "")
+        : rclcpp::Node(node_name)
     {
         const std::string package_share_dir = ament_index_cpp::get_package_share_directory("petr");
         std::string onnxPath = package_share_dir + "/models/onnx/3dppe_v_pe.onnx";
@@ -48,13 +51,16 @@ public:
         params.prec = model::precision::FP32;
         params.n_view = 6;
         params.ws_size = 1ULL << 32;  // 4GB workspace for large PETR TensorRT builds
+        params_ = params;
 
         // 创建一个worker的实例, 在创建的时候就完成初始化
         worker = thread::create_worker(onnxPath, level, params);
         marker_topic_ = this->declare_parameter<std::string>("marker_topic", "/petr/detections3d_markers");
         output_frame_ = this->declare_parameter<std::string>("output_frame", "base_link");
-        sensor_info_path_ = this->declare_parameter<std::string>(
-            "sensor_info_path", package_share_dir + "/config/sensor_info_nuscenes.yaml");
+        const std::string default_sensor_info_path =
+            cli_sensor_info_path.empty() ? package_share_dir + "/config/nuscenes_sensor_yaml/scene-0061.yaml" : cli_sensor_info_path;
+        sensor_info_path_ = resolve_config_path(this->declare_parameter<std::string>(
+            "sensor_info_path", default_sensor_info_path), package_share_dir);
         marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             marker_topic_, rclcpp::QoS(10));
 
@@ -76,7 +82,11 @@ public:
         projection_matrices_.resize(kCameraCount);
         has_projection_matrix_.assign(kCameraCount, false);
         image_publishers_.resize(kCameraCount);
-        load_projection_matrices_from_yaml(sensor_info_path_);
+        intrinsics_tensor_.assign(kCameraCount * 16, 0.0f);
+        extrinsics_tensor_.assign(kCameraCount * 16, 0.0f);
+        img2lidar_tensor_.assign(kCameraCount * 16, 0.0f);
+        load_camera_calibration_from_yaml(sensor_info_path_);
+        worker->set_sensor_tensors(intrinsics_tensor_, extrinsics_tensor_, img2lidar_tensor_);
 
         for (std::size_t camera_index = 0; camera_index < kCameraCount; ++camera_index) {
             if (!has_projection_matrix_[camera_index]) {
@@ -140,6 +150,65 @@ public:
 
 private:
     using ProjectionMatrix = cv::Matx34d;
+    using Matrix4x4 = cv::Matx44d;
+
+    static std::string resolve_config_path(const std::string &config_path, const std::string &package_share_dir)
+    {
+        if (config_path.empty()) {
+            return package_share_dir + "/config/nuscenes_sensor_yaml/scene-0061.yaml";
+        }
+
+        const std::filesystem::path candidate(config_path);
+        if (candidate.is_absolute()) {
+            return candidate.lexically_normal().string();
+        }
+
+        const std::filesystem::path from_config_dir = std::filesystem::path(package_share_dir) / "config" / candidate;
+        if (std::filesystem::exists(from_config_dir)) {
+            return from_config_dir.lexically_normal().string();
+        }
+
+        return (std::filesystem::path(package_share_dir) / candidate).lexically_normal().string();
+    }
+
+    static bool parse_matrix4x4(const YAML::Node &matrix_node, Matrix4x4 &matrix)
+    {
+        if (!matrix_node || !matrix_node.IsSequence() || matrix_node.size() < 4) {
+            return false;
+        }
+
+        Matrix4x4 parsed = Matrix4x4::eye();
+        for (std::size_t row = 0; row < 4; ++row) {
+            const YAML::Node row_node = matrix_node[row];
+            if (!row_node || !row_node.IsSequence() || row_node.size() < 4) {
+                return false;
+            }
+            for (std::size_t col = 0; col < 4; ++col) {
+                parsed(static_cast<int>(row), static_cast<int>(col)) = row_node[col].as<double>();
+            }
+        }
+
+        matrix = parsed;
+        return true;
+    }
+
+    static void flatten_matrix4x4(const Matrix4x4 &matrix, std::vector<float> &storage, std::size_t camera_index)
+    {
+        const std::size_t offset = camera_index * 16;
+        for (std::size_t row = 0; row < 4; ++row) {
+            for (std::size_t col = 0; col < 4; ++col) {
+                storage[offset + row * 4 + col] = static_cast<float>(matrix(static_cast<int>(row), static_cast<int>(col)));
+            }
+        }
+    }
+
+    static ProjectionMatrix to_projection_matrix(const Matrix4x4 &matrix)
+    {
+        return ProjectionMatrix(
+            matrix(0, 0), matrix(0, 1), matrix(0, 2), matrix(0, 3),
+            matrix(1, 0), matrix(1, 1), matrix(1, 2), matrix(1, 3),
+            matrix(2, 0), matrix(2, 1), matrix(2, 2), matrix(2, 3));
+    }
 
     static std::string make_visualization_topic(const std::string &image_topic)
     {
@@ -155,28 +224,7 @@ private:
         return image_topic + kVisualizationSuffix;
     }
 
-    bool load_projection_matrix(const std::vector<double> &matrix_data, ProjectionMatrix &projection_matrix) const
-    {
-        if (matrix_data.empty()) {
-            return false;
-        }
-
-        if (matrix_data.size() != 12) {
-            RCLCPP_ERROR(
-                this->get_logger(),
-                "Projection matrix parameter must contain 12 elements, but got %zu.",
-                matrix_data.size());
-            return false;
-        }
-
-        projection_matrix = ProjectionMatrix(
-            matrix_data[0], matrix_data[1], matrix_data[2], matrix_data[3],
-            matrix_data[4], matrix_data[5], matrix_data[6], matrix_data[7],
-            matrix_data[8], matrix_data[9], matrix_data[10], matrix_data[11]);
-        return true;
-    }
-
-    void load_projection_matrices_from_yaml(const std::string &yaml_path)
+    void load_camera_calibration_from_yaml(const std::string &yaml_path)
     {
         try {
             const YAML::Node root = YAML::LoadFile(yaml_path);
@@ -188,8 +236,7 @@ private:
 
             for (const auto &camera_node : camera_nodes) {
                 const YAML::Node name_node = camera_node["name"];
-                const YAML::Node lidar2img_node = camera_node["lidar2img"];
-                if (!name_node || !lidar2img_node || !lidar2img_node.IsSequence() || lidar2img_node.size() < 3) {
+                if (!name_node) {
                     continue;
                 }
 
@@ -199,31 +246,59 @@ private:
                     continue;
                 }
 
-                std::vector<double> projection_data;
-                projection_data.reserve(12);
-                bool valid_matrix = true;
-                for (std::size_t row = 0; row < 3 && valid_matrix; ++row) {
-                    const YAML::Node row_node = lidar2img_node[row];
-                    if (!row_node || !row_node.IsSequence() || row_node.size() < 4) {
-                        valid_matrix = false;
-                        break;
-                    }
-                    for (std::size_t col = 0; col < 4; ++col) {
-                        projection_data.push_back(row_node[col].as<double>());
-                    }
-                }
+                Matrix4x4 intrinsics = Matrix4x4::eye();
+                Matrix4x4 extrinsics = Matrix4x4::eye();
+                Matrix4x4 lidar2img = Matrix4x4::eye();
+                Matrix4x4 img2lidar = Matrix4x4::eye();
+                const bool has_intrinsics = parse_matrix4x4(camera_node["intrinsics"], intrinsics);
+                const bool has_cam2lidar = parse_matrix4x4(camera_node["cam2lidar"], extrinsics);
+                const bool has_lidar2cam = parse_matrix4x4(camera_node["lidar2cam"], lidar2cam_matrices_[static_cast<std::size_t>(std::distance(camera_names_.begin(), camera_iter))]);
+                const bool has_lidar2img = parse_matrix4x4(camera_node["lidar2img"], lidar2img);
+                const bool has_img2lidar = parse_matrix4x4(camera_node["img2lidar"], img2lidar);
 
-                if (!valid_matrix) {
+                if (!has_intrinsics) {
                     RCLCPP_ERROR(
                         this->get_logger(),
-                        "Invalid lidar2img matrix for %s in %s.",
+                        "Invalid intrinsics matrix for %s in %s.",
                         camera_name.c_str(),
                         yaml_path.c_str());
                     continue;
                 }
 
                 const std::size_t camera_index = static_cast<std::size_t>(std::distance(camera_names_.begin(), camera_iter));
-                has_projection_matrix_[camera_index] = load_projection_matrix(projection_data, projection_matrices_[camera_index]);
+                if (!has_cam2lidar && has_lidar2cam) {
+                    extrinsics = lidar2cam_matrices_[camera_index].inv();
+                } else if (!has_cam2lidar) {
+                    RCLCPP_ERROR(
+                        this->get_logger(),
+                        "Missing cam2lidar/lidar2cam for %s in %s.",
+                        camera_name.c_str(),
+                        yaml_path.c_str());
+                    continue;
+                }
+
+                if (!has_lidar2cam) {
+                    lidar2cam_matrices_[camera_index] = extrinsics.inv();
+                }
+
+                if (!has_lidar2img) {
+                    lidar2img = intrinsics * lidar2cam_matrices_[camera_index];
+                }
+
+                if (!has_img2lidar) {
+                    RCLCPP_ERROR(
+                        this->get_logger(),
+                        "Missing img2lidar for %s in %s.",
+                        camera_name.c_str(),
+                        yaml_path.c_str());
+                    continue;
+                }
+
+                flatten_matrix4x4(intrinsics, intrinsics_tensor_, camera_index);
+                flatten_matrix4x4(extrinsics, extrinsics_tensor_, camera_index);
+                flatten_matrix4x4(img2lidar, img2lidar_tensor_, camera_index);
+                projection_matrices_[camera_index] = to_projection_matrix(lidar2img);
+                has_projection_matrix_[camera_index] = true;
             }
         } catch (const YAML::Exception &e) {
             RCLCPP_ERROR(
@@ -262,7 +337,7 @@ private:
             (label * 193) % 255);
     }
 
-    cv::Point3d get_box_center_in_output_frame(const model::detector::bbox3d &box) const
+    cv::Point3d get_box_center_in_lidar_frame(const model::detector::bbox3d &box) const
     {
         return cv::Point3d(
             static_cast<double>(box.cx),
@@ -270,7 +345,12 @@ private:
             static_cast<double>(box.cz));
     }
 
-    std::array<cv::Point3d, 8> get_box_corners_in_output_frame(const model::detector::bbox3d &box) const
+    cv::Point3d convert_lidar_point_to_ros_frame(const cv::Point3d &point) const
+    {
+        return cv::Point3d(point.y, -point.x, point.z);
+    }
+
+    std::array<cv::Point3d, 8> get_box_corners_in_lidar_frame(const model::detector::bbox3d &box) const
     {
         const double half_length = static_cast<double>(box.l) * 0.5;
         const double half_width = static_cast<double>(box.w) * 0.5;
@@ -278,17 +358,17 @@ private:
         const double yaw = std::atan2(static_cast<double>(box.rot_sine), static_cast<double>(box.rot_cosine));
         const double cos_yaw = std::cos(yaw);
         const double sin_yaw = std::sin(yaw);
-        const cv::Point3d center = get_box_center_in_output_frame(box);
+        const cv::Point3d center = get_box_center_in_lidar_frame(box);
 
         const std::array<cv::Point3d, 8> local_corners = {
-            cv::Point3d( half_length,  half_width,  half_height),
-            cv::Point3d( half_length, -half_width,  half_height),
-            cv::Point3d(-half_length, -half_width,  half_height),
-            cv::Point3d(-half_length,  half_width,  half_height),
-            cv::Point3d( half_length,  half_width, -half_height),
-            cv::Point3d( half_length, -half_width, -half_height),
-            cv::Point3d(-half_length, -half_width, -half_height),
-            cv::Point3d(-half_length,  half_width, -half_height)};
+            cv::Point3d( half_width,  half_length,  half_height),
+            cv::Point3d(-half_width,  half_length,  half_height),
+            cv::Point3d(-half_width, -half_length,  half_height),
+            cv::Point3d( half_width, -half_length,  half_height),
+            cv::Point3d( half_width,  half_length, -half_height),
+            cv::Point3d(-half_width,  half_length, -half_height),
+            cv::Point3d(-half_width, -half_length, -half_height),
+            cv::Point3d( half_width, -half_length, -half_height)};
 
         std::array<cv::Point3d, 8> corners;
         for (std::size_t i = 0; i < local_corners.size(); ++i) {
@@ -327,7 +407,7 @@ private:
             std::pair<int, int>(4, 5), std::pair<int, int>(5, 6), std::pair<int, int>(6, 7), std::pair<int, int>(7, 4),
             std::pair<int, int>(0, 4), std::pair<int, int>(1, 5), std::pair<int, int>(2, 6), std::pair<int, int>(3, 7)};
 
-        const auto corners = get_box_corners_in_output_frame(box);
+        const auto corners = get_box_corners_in_lidar_frame(box);
         std::array<cv::Point2d, 8> projected_corners;
         std::array<bool, 8> valid_corners{};
         int valid_count = 0;
@@ -391,10 +471,20 @@ private:
                 continue;
             }
 
-            cv::Mat visualized_image = decoded_images[camera_index].clone();
+            cv::Mat visualized_image;
+            cv::resize(
+                decoded_images[camera_index],
+                visualized_image,
+                cv::Size(params_.img.w, params_.img.h),
+                0.0,
+                0.0,
+                cv::INTER_LINEAR);
             if (has_projection_matrix_[camera_index]) {
                 for (const auto &box : detections) {
-                    draw_projected_box(visualized_image, projection_matrices_[camera_index], box);
+                    draw_projected_box(
+                        visualized_image,
+                        projection_matrices_[camera_index],
+                        box);
                 }
             }
 
@@ -433,9 +523,10 @@ private:
             cube_marker.id = marker_id++;
             cube_marker.type = visualization_msgs::msg::Marker::CUBE;
             cube_marker.action = visualization_msgs::msg::Marker::ADD;
-            cube_marker.pose.position.x = box.cy;
-            cube_marker.pose.position.y = -box.cx;
-            cube_marker.pose.position.z = box.cz + 2.0;
+            const cv::Point3d box_center_in_ros = convert_lidar_point_to_ros_frame(get_box_center_in_lidar_frame(box));
+            cube_marker.pose.position.x = box_center_in_ros.x;
+            cube_marker.pose.position.y = box_center_in_ros.y;
+            cube_marker.pose.position.z = box_center_in_ros.z;
             cube_marker.pose.orientation.x = 0.0;
             cube_marker.pose.orientation.y = 0.0;
             cube_marker.pose.orientation.z = std::sin(yaw * 0.5);
@@ -457,9 +548,9 @@ private:
             text_marker.id = marker_id++;
             text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
             text_marker.action = visualization_msgs::msg::Marker::ADD;
-            text_marker.pose.position.x = box.cy;
-            text_marker.pose.position.y = -box.cx;
-            text_marker.pose.position.z = box.cz + height * 0.6;
+            text_marker.pose.position.x = box_center_in_ros.x;
+            text_marker.pose.position.y = box_center_in_ros.y;
+            text_marker.pose.position.z = box_center_in_ros.z + height * 0.6;
             text_marker.pose.orientation.w = 1.0;
             text_marker.scale.z = 0.8;
             text_marker.color.a = 1.0f;
@@ -494,8 +585,13 @@ private:
     std::shared_ptr<thread::Worker> worker;
     std::array<std::string, kCameraCount> camera_names_;
     std::array<std::string, kCameraCount> image_topics_;
+    std::array<Matrix4x4, kCameraCount> lidar2cam_matrices_{};
     std::vector<ProjectionMatrix> projection_matrices_;
     std::vector<bool> has_projection_matrix_;
+    std::vector<float> intrinsics_tensor_;
+    std::vector<float> extrinsics_tensor_;
+    std::vector<float> img2lidar_tensor_;
+    model::Params params_{};
     std::string marker_topic_;
     std::string output_frame_;
     std::string sensor_info_path_;
@@ -506,9 +602,27 @@ private:
 int main(int argc, char const *argv[])
 {
     /*这么实现目的在于让调用的整个过程精简化*/
-    rclcpp::init(argc, argv);
+    std::string cli_sensor_info_path;
+    std::vector<char *> ros_argv;
+    ros_argv.reserve(static_cast<std::size_t>(argc));
+    ros_argv.push_back(const_cast<char *>(argv[0]));
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--sensor-config" && i + 1 < argc) {
+            cli_sensor_info_path = argv[++i];
+            continue;
+        }
+        constexpr char kSensorConfigPrefix[] = "--sensor-config=";
+        if (arg.rfind(kSensorConfigPrefix, 0) == 0) {
+            cli_sensor_info_path = arg.substr(sizeof(kSensorConfigPrefix) - 1);
+            continue;
+        }
+        ros_argv.push_back(const_cast<char *>(argv[i]));
+    }
+
+    rclcpp::init(static_cast<int>(ros_argv.size()), ros_argv.data());
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 1, true);
-    auto node = std::make_shared<MultiCamDetectorNode>("MultiCamDetector");
+    auto node = std::make_shared<MultiCamDetectorNode>("MultiCamDetector", cli_sensor_info_path);
     executor.add_node(node);
     executor.spin();
     // rclcpp::shutdown();

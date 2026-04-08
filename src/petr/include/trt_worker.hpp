@@ -18,6 +18,10 @@ public:
     void inference(cv::Mat image);
     void inference_multi(const std::vector<cv::Mat>& views);
     std::vector<model::detector::bbox3d> inference_multi_and_get_result(const std::vector<cv::Mat>& views);
+    void set_sensor_tensors(
+        const std::vector<float>& intrinsics,
+        const std::vector<float>& extrinsics,
+        const std::vector<float>& img2lidar);
 
 public:
     std::shared_ptr<logger::Logger>          m_logger;

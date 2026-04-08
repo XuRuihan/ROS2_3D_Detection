@@ -60,6 +60,16 @@ std::vector<model::detector::bbox3d> Worker::inference_multi_and_get_result(cons
     return m_detector->get_bboxes3d();
 }
 
+void Worker::set_sensor_tensors(
+    const std::vector<float>& intrinsics,
+    const std::vector<float>& extrinsics,
+    const std::vector<float>& img2lidar)
+{
+    if (m_detector != nullptr) {
+        m_detector->set_sensor_tensors(intrinsics, extrinsics, img2lidar);
+    }
+}
+
 shared_ptr<Worker> create_worker(
     std::string onnxPath, logger::Level level, model::Params params) 
 {

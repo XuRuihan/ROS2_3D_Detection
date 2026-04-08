@@ -64,25 +64,63 @@ public:
     bool preprocess_gpu_multi(const std::vector<cv::Mat>& views);
     void inference_multi(const std::vector<cv::Mat>& views);
     const std::vector<bbox3d>& get_bboxes3d() const;
+    void set_sensor_tensors(
+        const std::vector<float>& intrinsics,
+        const std::vector<float>& extrinsics,
+        const std::vector<float>& img2lidar);
 
 private:
+    enum class InputTensorSlot {
+        Images = 0,
+        Intrinsics,
+        Extrinsics,
+        Img2Lidar,
+        Count
+    };
+
+    enum class OutputTensorSlot {
+        Scores = 0,
+        Labels,
+        Bboxes,
+        AllClsScores,
+        AllBBoxPreds,
+        Count
+    };
+
+    bool copy_aux_input_to_device();
+
     std::vector<bbox> m_bboxes;
     std::vector<bbox3d> m_bboxes3d;
     int m_inputSize; 
     int m_imgArea;
+    std::size_t m_auxInputSizes[3]{};
+    float* m_inputMemory_intrinsics[2]{};
+    float* m_inputMemory_extrinsics[2]{};
+    float* m_inputMemory_img2lidar[2]{};
+    std::vector<float> m_intrinsicsData;
+    std::vector<float> m_extrinsicsData;
+    std::vector<float> m_img2lidarData;
     // For PETR: scores, labels, bboxes
     float* m_outputMemory_scores[2];
     void* m_outputMemory_labels[2];
     float* m_outputMemory_bboxes[2];
+    float* m_outputMemory_allClsScores[2]{};
+    float* m_outputMemory_allBBoxPreds[2]{};
     nvinfer1::Dims m_outputDims_scores;
     nvinfer1::Dims m_outputDims_labels;
     nvinfer1::Dims m_outputDims_bboxes;
+    nvinfer1::Dims m_outputDims_allClsScores;
+    nvinfer1::Dims m_outputDims_allBBoxPreds;
     nvinfer1::DataType m_outputType_scores;
     nvinfer1::DataType m_outputType_labels;
     nvinfer1::DataType m_outputType_bboxes;
+    nvinfer1::DataType m_outputType_allClsScores{};
+    nvinfer1::DataType m_outputType_allBBoxPreds{};
     std::size_t m_outputSize_scores;
     std::size_t m_outputSize_labels;
     std::size_t m_outputSize_bboxes;
+    std::size_t m_outputSize_allClsScores{};
+    std::size_t m_outputSize_allBBoxPreds{};
 };
 
 // 外部调用的接口

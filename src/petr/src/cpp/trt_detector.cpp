@@ -65,6 +65,32 @@ const char* get_data_type_name(nvinfer1::DataType data_type) {
     }
 }
 
+bool contains_token(const std::string& value, const std::string& token) {
+    return value.find(token) != std::string::npos;
+}
+
+bool is_decoded_scores_output(const std::string& binding_name) {
+    return contains_token(binding_name, "decoded_scores")
+        || (contains_token(binding_name, "score") && !contains_token(binding_name, "all_cls_scores"));
+}
+
+bool is_decoded_labels_output(const std::string& binding_name) {
+    return contains_token(binding_name, "decoded_labels") || contains_token(binding_name, "label");
+}
+
+bool is_decoded_bboxes_output(const std::string& binding_name) {
+    return contains_token(binding_name, "decoded_bboxes")
+        || (contains_token(binding_name, "bbox") && !contains_token(binding_name, "all_bbox_preds"));
+}
+
+bool is_all_cls_scores_output(const std::string& binding_name) {
+    return contains_token(binding_name, "all_cls_scores");
+}
+
+bool is_all_bbox_preds_output(const std::string& binding_name) {
+    return contains_token(binding_name, "all_bbox_preds");
+}
+
 }  // namespace
 
 float iou_calc(bbox bbox1, bbox bbox2){
@@ -98,24 +124,140 @@ void Detector::setup(void const* data, size_t size) {
     m_engine      = shared_ptr<ICudaEngine>(m_runtime->deserializeCudaEngine(data, size), destroy_trt_ptr<ICudaEngine>);
     m_context     = shared_ptr<IExecutionContext>(m_engine->createExecutionContext(), destroy_trt_ptr<IExecutionContext>);
     
-    int numBindings = m_engine->getNbBindings();
-    assert(numBindings == 4); // 1 input, 3 outputs for PETR
+    const int numBindings = m_engine->getNbBindings();
+    int inputBindingCount = 0;
+    int outputBindingCount = 0;
+    for (int i = 0; i < numBindings; ++i) {
+        if (m_engine->bindingIsInput(i)) {
+            ++inputBindingCount;
+        } else {
+            ++outputBindingCount;
+        }
+    }
 
-    m_inputDims = m_context->getBindingDimensions(0);
-    m_outputDims_scores = m_context->getBindingDimensions(1);
-    m_outputDims_labels = m_context->getBindingDimensions(2);
-    m_outputDims_bboxes = m_context->getBindingDimensions(3);
-    m_outputType_scores = m_engine->getBindingDataType(1);
-    m_outputType_labels = m_engine->getBindingDataType(2);
-    m_outputType_bboxes = m_engine->getBindingDataType(3);
+    if (inputBindingCount != 1 && inputBindingCount != 4) {
+        LOGE("Unexpected PETR input binding count: %d. Expected 1 (legacy) or 4 (images + intrinsics + extrinsics + img2lidar). Total bindings=%d",
+             inputBindingCount, numBindings);
+        return;
+    }
+
+    if (outputBindingCount != 3 && outputBindingCount != 5) {
+        LOGE("Unexpected PETR output binding count: %d. Expected 3 (decoded outputs only) or 5 (decoded outputs + all_cls_scores + all_bbox_preds). Total bindings=%d",
+             outputBindingCount, numBindings);
+        return;
+    }
+
+    m_bindings.assign(numBindings, nullptr);
 
     CUDA_CHECK(cudaStreamCreate(&m_stream));
     
     m_inputSize     = m_params->n_view * m_params->img.h * m_params->img.w * m_params->img.c * sizeof(float);
     m_imgArea       = m_params->img.h * m_params->img.w;
+    m_auxInputSizes[0] = static_cast<std::size_t>(m_params->n_view) * 4 * 4 * sizeof(float);
+    m_auxInputSizes[1] = static_cast<std::size_t>(m_params->n_view) * 4 * 4 * sizeof(float);
+    m_auxInputSizes[2] = static_cast<std::size_t>(m_params->n_view) * 4 * 4 * sizeof(float);
+
+    // 这里对host和device上的memory一起分配空间
+    CUDA_CHECK(cudaMallocHost(&m_inputMemory[0], m_inputSize));
+    CUDA_CHECK(cudaMalloc(&m_inputMemory[1], m_inputSize));
+    if (inputBindingCount == 4) {
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_inputMemory_intrinsics[0]), m_auxInputSizes[0]));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_inputMemory_intrinsics[1]), m_auxInputSizes[0]));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_inputMemory_extrinsics[0]), m_auxInputSizes[1]));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_inputMemory_extrinsics[1]), m_auxInputSizes[1]));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_inputMemory_img2lidar[0]), m_auxInputSizes[2]));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_inputMemory_img2lidar[1]), m_auxInputSizes[2]));
+    }
+
+    LOGV("TensorRT bindings for PETR:");
+    int fallbackInputIndex = 0;
+    int fallbackOutputIndex = 0;
+    for (int i = 0; i < numBindings; ++i) {
+        const char* binding_name = m_engine->getBindingName(i);
+        const bool is_input = m_engine->bindingIsInput(i);
+        const nvinfer1::Dims binding_dims = m_context->getBindingDimensions(i);
+        const nvinfer1::DataType binding_type = m_engine->getBindingDataType(i);
+        const std::string binding_name_str = binding_name != nullptr ? binding_name : "";
+
+        if (is_input) {
+            if (contains_token(binding_name_str, "intrinsics")) {
+                m_bindings[i] = m_inputMemory_intrinsics[1];
+            } else if (contains_token(binding_name_str, "extrinsics")) {
+                m_bindings[i] = m_inputMemory_extrinsics[1];
+            } else if (contains_token(binding_name_str, "img2lidar")) {
+                m_bindings[i] = m_inputMemory_img2lidar[1];
+            } else if (contains_token(binding_name_str, "img") || contains_token(binding_name_str, "image")) {
+                m_bindings[i] = m_inputMemory[1];
+            } else if (fallbackInputIndex == static_cast<int>(InputTensorSlot::Images)) {
+                m_bindings[i] = m_inputMemory[1];
+            } else if (fallbackInputIndex == static_cast<int>(InputTensorSlot::Intrinsics)) {
+                m_bindings[i] = m_inputMemory_intrinsics[1];
+            } else if (fallbackInputIndex == static_cast<int>(InputTensorSlot::Extrinsics)) {
+                m_bindings[i] = m_inputMemory_extrinsics[1];
+            } else {
+                m_bindings[i] = m_inputMemory_img2lidar[1];
+            }
+            if (fallbackInputIndex < inputBindingCount) {
+                ++fallbackInputIndex;
+            }
+        } else {
+            if (is_all_cls_scores_output(binding_name_str)) {
+                m_outputDims_allClsScores = binding_dims;
+                m_outputType_allClsScores = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (is_all_bbox_preds_output(binding_name_str)) {
+                m_outputDims_allBBoxPreds = binding_dims;
+                m_outputType_allBBoxPreds = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (is_decoded_scores_output(binding_name_str)) {
+                m_outputDims_scores = binding_dims;
+                m_outputType_scores = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (is_decoded_labels_output(binding_name_str)) {
+                m_outputDims_labels = binding_dims;
+                m_outputType_labels = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (is_decoded_bboxes_output(binding_name_str)) {
+                m_outputDims_bboxes = binding_dims;
+                m_outputType_bboxes = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Scores)) {
+                m_outputDims_scores = binding_dims;
+                m_outputType_scores = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Labels)) {
+                m_outputDims_labels = binding_dims;
+                m_outputType_labels = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Bboxes)) {
+                m_outputDims_bboxes = binding_dims;
+                m_outputType_bboxes = binding_type;
+                m_bindings[i] = nullptr;
+            } else if (fallbackOutputIndex == static_cast<int>(OutputTensorSlot::AllClsScores)) {
+                m_outputDims_allClsScores = binding_dims;
+                m_outputType_allClsScores = binding_type;
+                m_bindings[i] = nullptr;
+            } else {
+                m_outputDims_allBBoxPreds = binding_dims;
+                m_outputType_allBBoxPreds = binding_type;
+                m_bindings[i] = nullptr;
+            }
+            ++fallbackOutputIndex;
+        }
+
+        LOGV("  binding[%d]: name=%s, role=%s, dtype=%s, dims=%s",
+             i,
+             binding_name != nullptr ? binding_name : "<null>",
+             is_input ? "input" : "output",
+             get_data_type_name(binding_type),
+             printDims(binding_dims).c_str());
+    }
+
     m_outputSize_scores = get_element_count(m_outputDims_scores) * get_data_type_size(m_outputType_scores);
     m_outputSize_labels = get_element_count(m_outputDims_labels) * get_data_type_size(m_outputType_labels);
     m_outputSize_bboxes = get_element_count(m_outputDims_bboxes) * get_data_type_size(m_outputType_bboxes);
+    m_outputSize_allClsScores = get_element_count(m_outputDims_allClsScores) * get_data_type_size(m_outputType_allClsScores);
+    m_outputSize_allBBoxPreds = get_element_count(m_outputDims_allBBoxPreds) * get_data_type_size(m_outputType_allBBoxPreds);
 
     if (m_outputSize_scores == 0 || m_outputSize_labels == 0 || m_outputSize_bboxes == 0) {
         LOGE("Unsupported output data type: scores=%d, labels=%d, bboxes=%d",
@@ -125,34 +267,44 @@ void Detector::setup(void const* data, size_t size) {
         return;
     }
 
-    // 这里对host和device上的memory一起分配空间
-    CUDA_CHECK(cudaMallocHost(&m_inputMemory[0], m_inputSize));
     CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_outputMemory_scores[0]), m_outputSize_scores));
     CUDA_CHECK(cudaMallocHost(&m_outputMemory_labels[0], m_outputSize_labels));
     CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_outputMemory_bboxes[0]), m_outputSize_bboxes));
-    CUDA_CHECK(cudaMalloc(&m_inputMemory[1], m_inputSize));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_outputMemory_scores[1]), m_outputSize_scores));
     CUDA_CHECK(cudaMalloc(&m_outputMemory_labels[1], m_outputSize_labels));
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_outputMemory_bboxes[1]), m_outputSize_bboxes));
+    if (m_outputSize_allClsScores > 0) {
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_outputMemory_allClsScores[0]), m_outputSize_allClsScores));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_outputMemory_allClsScores[1]), m_outputSize_allClsScores));
+    }
+    if (m_outputSize_allBBoxPreds > 0) {
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&m_outputMemory_allBBoxPreds[0]), m_outputSize_allBBoxPreds));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&m_outputMemory_allBBoxPreds[1]), m_outputSize_allBBoxPreds));
+    }
 
-    // 创建m_bindings
-    m_bindings[0] = m_inputMemory[1];
-    m_bindings[1] = m_outputMemory_scores[1];
-    m_bindings[2] = m_outputMemory_labels[1];
-    m_bindings[3] = m_outputMemory_bboxes[1];
-
-    LOGV("TensorRT bindings for PETR:");
+    fallbackOutputIndex = 0;
     for (int i = 0; i < numBindings; ++i) {
+        if (m_engine->bindingIsInput(i)) {
+            continue;
+        }
         const char* binding_name = m_engine->getBindingName(i);
-        const bool is_input = m_engine->bindingIsInput(i);
-        const nvinfer1::Dims binding_dims = m_context->getBindingDimensions(i);
-        const nvinfer1::DataType binding_type = m_engine->getBindingDataType(i);
-        LOGV("  binding[%d]: name=%s, role=%s, dtype=%s, dims=%s",
-             i,
-             binding_name != nullptr ? binding_name : "<null>",
-             is_input ? "input" : "output",
-             get_data_type_name(binding_type),
-             printDims(binding_dims).c_str());
+        const std::string binding_name_str = binding_name != nullptr ? binding_name : "";
+        if (is_all_cls_scores_output(binding_name_str)) {
+            m_bindings[i] = m_outputMemory_allClsScores[1];
+        } else if (is_all_bbox_preds_output(binding_name_str)) {
+            m_bindings[i] = m_outputMemory_allBBoxPreds[1];
+        } else if (is_decoded_scores_output(binding_name_str) || fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Scores)) {
+            m_bindings[i] = m_outputMemory_scores[1];
+        } else if (is_decoded_labels_output(binding_name_str) || fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Labels)) {
+            m_bindings[i] = m_outputMemory_labels[1];
+        } else if (is_decoded_bboxes_output(binding_name_str) || fallbackOutputIndex == static_cast<int>(OutputTensorSlot::Bboxes)) {
+            m_bindings[i] = m_outputMemory_bboxes[1];
+        } else if (fallbackOutputIndex == static_cast<int>(OutputTensorSlot::AllClsScores)) {
+            m_bindings[i] = m_outputMemory_allClsScores[1];
+        } else {
+            m_bindings[i] = m_outputMemory_allBBoxPreds[1];
+        }
+        ++fallbackOutputIndex;
     }
 }
 
@@ -215,9 +367,56 @@ bool Detector::preprocess_cpu_multi(const std::vector<cv::Mat>& views) {
 
     /*Preprocess -- 将host的数据移动到device上*/
     CUDA_CHECK(cudaMemcpyAsync(m_inputMemory[1], m_inputMemory[0], m_inputSize, cudaMemcpyKind::cudaMemcpyHostToDevice, m_stream));
+    if (!copy_aux_input_to_device()) {
+        return false;
+    }
 
     m_timer->stop_cpu();
     m_timer->duration_cpu<timer::Timer::ms>("preprocess(CPU)");
+    return true;
+}
+
+bool Detector::copy_aux_input_to_device() {
+    if (m_inputMemory_intrinsics[0] == nullptr ||
+        m_inputMemory_extrinsics[0] == nullptr ||
+        m_inputMemory_img2lidar[0] == nullptr) {
+        return true;
+    }
+
+    const std::size_t matrix_element_count = static_cast<std::size_t>(m_params->n_view) * 4 * 4;
+    if (m_intrinsicsData.size() != matrix_element_count ||
+        m_extrinsicsData.size() != matrix_element_count ||
+        m_img2lidarData.size() != matrix_element_count) {
+        LOGE("Sensor tensor size mismatch. Expected %zu floats for each tensor, got intrinsics=%zu extrinsics=%zu img2lidar=%zu",
+             matrix_element_count,
+             m_intrinsicsData.size(),
+             m_extrinsicsData.size(),
+             m_img2lidarData.size());
+        return false;
+    }
+
+    std::copy(m_intrinsicsData.begin(), m_intrinsicsData.end(), m_inputMemory_intrinsics[0]);
+    std::copy(m_extrinsicsData.begin(), m_extrinsicsData.end(), m_inputMemory_extrinsics[0]);
+    std::copy(m_img2lidarData.begin(), m_img2lidarData.end(), m_inputMemory_img2lidar[0]);
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        m_inputMemory_intrinsics[1],
+        m_inputMemory_intrinsics[0],
+        m_auxInputSizes[0],
+        cudaMemcpyKind::cudaMemcpyHostToDevice,
+        m_stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        m_inputMemory_extrinsics[1],
+        m_inputMemory_extrinsics[0],
+        m_auxInputSizes[1],
+        cudaMemcpyKind::cudaMemcpyHostToDevice,
+        m_stream));
+    CUDA_CHECK(cudaMemcpyAsync(
+        m_inputMemory_img2lidar[1],
+        m_inputMemory_img2lidar[0],
+        m_auxInputSizes[2],
+        cudaMemcpyKind::cudaMemcpyHostToDevice,
+        m_stream));
     return true;
 }
 
@@ -379,6 +578,16 @@ void Detector::inference_multi(const std::vector<cv::Mat>& views) {
 
 const std::vector<bbox3d>& Detector::get_bboxes3d() const {
     return m_bboxes3d;
+}
+
+void Detector::set_sensor_tensors(
+    const std::vector<float>& intrinsics,
+    const std::vector<float>& extrinsics,
+    const std::vector<float>& img2lidar)
+{
+    m_intrinsicsData = intrinsics;
+    m_extrinsicsData = extrinsics;
+    m_img2lidarData = img2lidar;
 }
 
 shared_ptr<Detector> make_detector(
